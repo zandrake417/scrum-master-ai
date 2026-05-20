@@ -1,3 +1,12 @@
+:root {
+  --color-background-primary: #ffffff;
+  --color-background-secondary: #f8fafc;
+  --color-border-secondary: #e2e8f0;
+  --color-border-tertiary: #cbd5e1;
+  --color-text-primary: #111827;
+  --color-text-secondary: #475569;
+}
+
 * {
   box-sizing: border-box;
 }

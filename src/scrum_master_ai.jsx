@@ -14,6 +14,8 @@ Your role:
 4. **Risk Radar**: Proactively flag risks, dependencies, and potential blockers the team may not have explicitly mentioned.
 5. **Sprint Health**: Assess the sprint's health and team sentiment from the discussion tone and content.
 
+CRITICAL INSTRUCTION: You MUST write all generated text, summaries, titles, descriptions, action items, and risks in Indonesian (Bahasa Indonesia). Only the JSON keys should remain in English.
+
 OUTPUT FORMAT — respond ONLY with valid JSON matching this exact schema:
 
 {
@@ -209,6 +211,7 @@ export default function ScrumMasterAI() {
   const [transcript, setTranscript] = useState("");
   const [isRecording, setIsRecording] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [isUploadingAudio, setIsUploadingAudio] = useState(false);
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
   const [activeTab, setActiveTab] = useState("kanban");
@@ -216,7 +219,7 @@ export default function ScrumMasterAI() {
   const [filterCol, setFilterCol] = useState("All");
   const [filterPriority, setFilterPriority] = useState("All");
   const [recordingTime, setRecordingTime] = useState(0);
-  const [inputMode, setInputMode] = useState("text"); // "text" | "mic"
+  const [inputMode, setInputMode] = useState("text"); // "text" | "mic" | "audio"
   const [streamStatus, setStreamStatus] = useState("");
 
   const wsRef = useRef(null);
@@ -225,6 +228,28 @@ export default function ScrumMasterAI() {
   const processorRef = useRef(null);
   const audioCtxRef = useRef(null);
 
+// ─── Fungsi untuk Memindahkan Status / Kolom Tiket ──────────────────────
+  const handleUpdateTicketStatus = (ticketId, newStatus) => {
+  // 1. Update status tiket di dalam state utama 'result'
+  setResult(prevResult => {
+    if (!prevResult || !prevResult.kanban_tickets) return prevResult;
+    return {
+      ...prevResult,
+      kanban_tickets: prevResult.kanban_tickets.map(ticket =>
+        ticket.id === ticketId ? { ...ticket, column: newStatus } : ticket
+      )
+    };
+  });
+
+  // 2. Update juga data tiket yang sedang aktif dibuka di modal detail
+  setSelectedTicket(prevTicket => {
+    if (prevTicket && prevTicket.id === ticketId) {
+      return { ...prevTicket, column: newStatus };
+    }
+    return prevTicket;
+  });
+};
+  
   // Timer
   useEffect(() => {
     if (isRecording) {
@@ -324,58 +349,110 @@ export default function ScrumMasterAI() {
     setStreamStatus("");
   }, []);
 
-  // ── Snifox AI (OpenAI-compatible) ─────────────────────────────────────────
-  const analyzeWithAI = useCallback(async () => {
-    if (!transcript.trim()) {
-      setError("Belum ada transkrip. Rekam atau ketik terlebih dahulu.");
+  // ── Groq Whisper Audio Upload ─────────────────────────────────────────────
+  const handleAudioUpload = async (event) => {
+    const file = event.target.files[0];
+    if (!file) return;
+
+    const MAX_FILE_SIZE = 25 * 1024 * 1024; // 25 MB
+    if (file.size > MAX_FILE_SIZE) {
+      setError("❌ Ukuran file terlalu besar (Maksimal 25MB).\nTips: Ubah format ke .m4a atau kompres ke bitrate lebih rendah.");
       return;
     }
-    setIsProcessing(true);
-    setError(null);
-    setResult(null);
 
+    setIsUploadingAudio(true);
+    setError(null);
+    setStreamStatus("Mengunggah & mentranskrip audio...");
+    
     try {
-      const res = await fetch("/api/chat/completions", {
+      const formData = new FormData();
+      formData.append("file", file);
+      formData.append("model", "whisper-large-v3");
+      formData.append("response_format", "json");
+      formData.append("language", "id");
+
+      const response = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: "google/gemini-2.5-flash",
-          messages: [
-            { role: "system", content: SCRUM_MASTER_SYSTEM },
-            {
-              role: "user",
-              content: `Analyze this meeting transcript as a Scrum Master. Extract all actionable insights and produce the full JSON artifact:\n\n---\n${transcript}\n---`,
-            },
-          ],
-          max_tokens: 8192,
-          temperature: 0.2,
-          top_p: 0.95,
-        }),
+        headers: {
+          "Authorization": `Bearer ${import.meta.env.VITE_GROQ_API_KEY}`
+        },
+        body: formData
       });
 
-      if (!res.ok) {
-        const errorText = await res.text();
-        throw new Error(`API request gagal: ${res.status} ${res.statusText} — ${errorText}`);
+      if (!response.ok) {
+        const errData = await response.json();
+        throw new Error(errData.error?.message || "Gagal memproses audio di Groq.");
       }
 
-      const data = await res.json();
-      if (data.error) throw new Error(data.error.message || JSON.stringify(data.error));
-
-      const rawText = data?.choices?.[0]?.message?.content || "";
-
-      if (!rawText) throw new Error("AI tidak menghasilkan JSON yang valid.");
-      const jsonMatch = rawText.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) throw new Error("AI tidak menghasilkan JSON yang valid.");
-
-      const parsed = JSON.parse(jsonMatch[0]);
-      setResult(parsed);
-      setActiveTab("kanban");
+      const data = await response.json();
+      setTranscript(prev => prev ? `${prev}\n\n${data.text}` : data.text);
+      setInputMode("text"); // Otomatis kembali ke mode teks untuk melihat hasilnya
+      setStreamStatus("");
     } catch (err) {
-      setError("Error: " + err.message);
+      console.error("Groq Upload Error:", err);
+      setError(`Gagal memproses audio: ${err.message}`);
+      setStreamStatus("");
     } finally {
-      setIsProcessing(false);
+      setIsUploadingAudio(false);
+      event.target.value = null; // Reset input agar bisa re-upload file yang sama jika perlu
     }
-  }, [transcript]);
+  };
+
+  // ── Snifox AI (OpenAI-compatible) ─────────────────────────────────────────
+// ── Otak Scrum Master Pakai GROQ (Llama 3) ─────────────────────────────────
+const analyzeWithAI = useCallback(async () => {
+  if (!transcript.trim()) {
+    setError("Belum ada transkrip. Rekam atau ketik terlebih dahulu.");
+    return;
+  }
+  setIsProcessing(true);
+  setError(null);
+  setResult(null);
+
+  try {
+    // Menembak langsung ke API Groq, bukan ke /api/chat/completions (Vite proxy)
+    const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: { 
+        "Content-Type": "application/json",
+        // Menyelipkan Authorization Header langsung di sini
+        "Authorization": `Bearer ${import.meta.env.VITE_GROQ_API_KEY}`
+      },
+      body: JSON.stringify({
+        model: "llama-3.3-70b-versatile", // Menggunakan model teks paling pintar di Groq
+        messages: [
+          { role: "system", content: SCRUM_MASTER_SYSTEM },
+          {
+            role: "user",
+            content: `Analyze this meeting transcript as a Scrum Master. Extract all actionable insights and produce the full JSON artifact:\n\n---\n${transcript}\n---`,
+          },
+        ],
+        response_format: { type: "json_object" }, // Paksa Groq membalas format JSON
+        temperature: 0.2,
+      }),
+    });
+
+    if (!res.ok) {
+      const errorData = await res.json();
+      throw new Error(`API request gagal: ${res.status} — ${errorData.error?.message || res.statusText}`);
+    }
+
+    const data = await res.json();
+    const rawText = data?.choices?.[0]?.message?.content || "";
+
+    if (!rawText) throw new Error("AI tidak menghasilkan respons yang valid.");
+    
+    // Parse hasil JSON dari Llama 3
+    const parsed = JSON.parse(rawText);
+    setResult(parsed);
+    setActiveTab("kanban");
+  } catch (err) {
+    console.error("Analysis Error:", err);
+    setError("Error: " + err.message);
+  } finally {
+    setIsProcessing(false);
+  }
+}, [transcript]);
 
   // ── Downloads ─────────────────────────────────────────────────────────────
   const downloadMD = () => {
@@ -434,7 +511,7 @@ export default function ScrumMasterAI() {
         <div style={{ display: "flex", gap: 8 }}>
           <input
             type="password"
-            placeholder="Soniox API Key (opsional — bisa input teks manual)"
+            placeholder="Soniox API Key (opsional — bisa input teks manual atau upload file)"
             value={soniox_key}
             onChange={e => setSoniox_key(e.target.value)}
             style={{ flex: 1, fontFamily: "inherit", fontSize: 13, padding: "7px 10px", border: "0.5px solid var(--color-border-secondary)", borderRadius: 8, background: "var(--color-background-secondary)", color: "var(--color-text-primary)" }}
@@ -447,13 +524,13 @@ export default function ScrumMasterAI() {
 
       {/* Step 2: Input */}
       <section style={{ marginBottom: "1.25rem", background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: 12, padding: "1rem 1.25rem" }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10, flexWrap: "wrap", gap: 8 }}>
           <p style={{ margin: 0, fontSize: 12, fontWeight: 500, color: "var(--color-text-secondary)", textTransform: "uppercase", letterSpacing: "0.06em" }}>② Transkrip Rapat</p>
           <div style={{ display: "flex", gap: 4, background: "var(--color-background-secondary)", borderRadius: 8, padding: 3, border: "0.5px solid var(--color-border-tertiary)" }}>
-            {["text", "mic"].map(m => (
-              <button key={m} onClick={() => setInputMode(m)} style={{ padding: "4px 12px", borderRadius: 6, border: "none", cursor: "pointer", fontSize: 12, fontWeight: 500, background: inputMode === m ? "var(--color-background-primary)" : "transparent", color: inputMode === m ? "var(--color-text-primary)" : "var(--color-text-secondary)", boxShadow: inputMode === m ? "0 1px 3px rgba(0,0,0,0.08)" : "none" }}>
-                <i className={`ti ti-${m === "text" ? "keyboard" : "microphone"}`} style={{ marginRight: 4 }} />
-                {m === "text" ? "Teks" : "Mikrofon"}
+            {["text", "mic", "audio"].map(m => (
+              <button key={m} onClick={() => setInputMode(m)} style={{ padding: "4px 12px", borderRadius: 6, border: "none", cursor: "pointer", fontSize: 12, fontWeight: 500, background: inputMode === m ? "var(--color-background-primary)" : "transparent", color: inputMode === m ? "var(--color-text-primary)" : "var(--color-text-secondary)", boxShadow: inputMode === m ? "0 1px 3px rgba(0,0,0,0.08)" : "none", display: "flex", alignItems: "center" }}>
+                <i className={`ti ti-${m === "text" ? "keyboard" : m === "mic" ? "microphone" : "upload"}`} style={{ marginRight: 4 }} />
+                {m === "text" ? "Teks" : m === "mic" ? "Mikrofon" : "Upload Audio"}
               </button>
             ))}
           </div>
@@ -475,6 +552,28 @@ export default function ScrumMasterAI() {
               </>
             )}
             {streamStatus && <span style={{ fontSize: 12, color: "var(--color-text-secondary)" }}>{streamStatus}</span>}
+          </div>
+        )}
+
+        {inputMode === "audio" && (
+          <div style={{ marginBottom: 12, display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", background: "var(--color-background-secondary)", borderRadius: 8, border: "0.5px solid var(--color-border-tertiary)" }}>
+            <label style={{ padding: "7px 16px", borderRadius: 8, border: "none", cursor: isUploadingAudio ? "not-allowed" : "pointer", fontWeight: 500, fontSize: 13, fontFamily: "inherit", background: isUploadingAudio ? "#B5D4F4" : "#185FA5", color: "#fff", display: "flex", alignItems: "center", gap: 6 }}>
+              {isUploadingAudio ? (
+                <><i className="ti ti-loader" style={{ animation: "spin 1s linear infinite" }} /> Memproses File...</>
+              ) : (
+                <><i className="ti ti-upload" /> Pilih File MP3 / M4A</>
+              )}
+              <input
+                type="file"
+                accept="audio/mp3, audio/wav, audio/m4a, audio/mpeg"
+                onChange={handleAudioUpload}
+                disabled={isUploadingAudio}
+                style={{ display: "none" }}
+              />
+            </label>
+            <span style={{ fontSize: 12, color: "var(--color-text-secondary)" }}>
+              {isUploadingAudio ? streamStatus : "Batas ukuran maksimal: 25MB"}
+            </span>
           </div>
         )}
 
@@ -815,8 +914,40 @@ export default function ScrumMasterAI() {
               </div>
             )}
 
+            
+
+            {/* TAMBAHKAN: Dropdown untuk mengubah status kolom tiket */}
+            <div style={{ marginBottom: 15 }}>
+              <p style={{ margin: "0 0 5px", fontSize: 12, fontWeight: 500, color: "var(--color-text-secondary)", textTransform: "uppercase", letterSpacing: "0.05em" }}>
+                Ubah Status / Kolom
+              </p>
+              <select
+                value={selectedTicket.column}
+                onChange={(e) => handleUpdateTicketStatus(selectedTicket.id, e.target.value)}
+                style={{
+                  width: "100%",
+                  padding: "8px 12px",
+                  borderRadius: 8,
+                  border: "0.5px solid var(--color-border-secondary)",
+                  background: "var(--color-background-secondary)",
+                  color: "var(--color-text-primary)",
+                  fontSize: 13,
+                  fontFamily: "inherit",
+                  cursor: "pointer",
+                  outline: "none"
+                }}
+              >
+                <option value="Backlog">Backlog</option>
+                <option value="To Do">To Do</option>
+                <option value="In Progress">In Progress</option>
+                <option value="Review">Review</option>
+                <option value="Done">Done</option>
+              </select>
+            </div>
+
+            {/* Kode bawaan Anda sebelumnya (Labels) */}
             {selectedTicket.labels?.length > 0 && (
-              <div style={{ marginBottom: 12 }}>
+              <div style={{ marginBottom: 15 }}>
                 <p style={{ margin: "0 0 5px", fontSize: 12, fontWeight: 500, color: "var(--color-text-secondary)", textTransform: "uppercase", letterSpacing: "0.05em" }}>Label</p>
                 <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
                   {selectedTicket.labels.map(l => (
