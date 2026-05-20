@@ -60,7 +60,6 @@ OUTPUT FORMAT — respond ONLY with valid JSON matching this exact schema:
       "priority": "Critical | High | Medium | Low",
       "column": "Backlog | To Do | In Progress | Review | Done",
       "story_points": number,
-      "ai_reasoning": "string — JELASKAN secara singkat KENAPA tiket ini dibuat dan KENAPA diberi poin sekian berdasarkan transkrip",
       "assignee": "string — name or 'Unassigned'",
       "labels": ["array", "of", "tags"],
       "dependencies": ["array of ticket IDs this depends on"],
@@ -99,6 +98,13 @@ function generateXLSX(tickets, meeting) {
   ]);
   const detailWs = XLSX.utils.aoa_to_sheet([headers, ...rows]);
   detailWs["!cols"] = [8, 35, 10, 10, 14, 8, 15, 20, 20, 40].map(wch => ({ wch }));
+  detailWs['!autofilter'] = { ref: "A1:J1" };
+  // Mengunci (Freeze) baris pertama dan kolom pertama
+  detailWs['!views'] = [{
+  state: 'frozen',
+  ySplit: 1, // Kunci 1 baris di atas
+  xSplit: 1  // Kunci 1 kolom di kiri (ID)
+}];
   XLSX.utils.book_append_sheet(wb, detailWs, "Ticket Details");
 
   // Summary sheet
@@ -209,22 +215,22 @@ const columnStyle = {
 // ─── Main Component ─────────────────────────────────────────────────────────
 export default function ScrumMasterAI() {
   const [soniox_key, setSoniox_key] = useState("");
-  
-  // 1. UBAH STATE TRANSCRIPT (Baca dari Local Storage)
-  const [transcript, setTranscript] = useState(() => {
-    return localStorage.getItem("scrum_ai_transcript") || "";
-  });
-  
+  const [transcript, setTranscript] = useState("");
   const [isRecording, setIsRecording] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [isUploadingAudio, setIsUploadingAudio] = useState(false);
-  
-  // 2. UBAH STATE RESULT (Baca dari Local Storage)
-  const [result, setResult] = useState(() => {
-    const saved = localStorage.getItem("scrum_ai_result");
-    return saved ? JSON.parse(saved) : null;
-  });
-  
+  // State untuk Integrasi Trello
+  const [trelloKey, setTrelloKey] = useState("");
+  const [trelloToken, setTrelloToken] = useState("");
+  const [trelloListId, setTrelloListId] = useState("");
+
+  // State untuk Integrasi Jira
+  const [jiraEmail, setJiraEmail] = useState("");
+  const [jiraToken, setJiraToken] = useState("");
+  const [jiraProjectKey, setJiraProjectKey] = useState("");
+
+const [pushStatus, setPushStatus] = useState("");
+  const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
   const [activeTab, setActiveTab] = useState("kanban");
   const [selectedTicket, setSelectedTicket] = useState(null);
@@ -239,32 +245,6 @@ export default function ScrumMasterAI() {
   const timerRef = useRef(null);
   const processorRef = useRef(null);
   const audioCtxRef = useRef(null);
-
-  // ==========================================
-  // 3. TAMBAHKAN USE-EFFECT AUTO SAVE DI SINI
-  // ==========================================
-  
-  // Auto-save transcript setiap kali mengetik/berubah
-  useEffect(() => {
-    localStorage.setItem("scrum_ai_transcript", transcript);
-  }, [transcript]);
-
-  // Auto-save result (tiket & notulensi) setiap kali AI selesai generate
-  useEffect(() => {
-    if (result) {
-      localStorage.setItem("scrum_ai_result", JSON.stringify(result));
-    } else {
-      localStorage.removeItem("scrum_ai_result");
-    }
-  }, [result]);
-  
-  // (Opsional) Tambahkan fungsi ini jika Anda ingin membuat tombol "Clear Data" di UI
-  const handleClearData = () => {
-    if(confirm("Apakah Anda yakin ingin menghapus semua data lokal?")) {
-      setTranscript("");
-      setResult(null);
-    }
-  };
 
 // ─── Fungsi untuk Memindahkan Status / Kolom Tiket ──────────────────────
   const handleUpdateTicketStatus = (ticketId, newStatus) => {
@@ -524,7 +504,75 @@ const analyzeWithAI = useCallback(async () => {
 
   const KANBAN_COLS = ["Backlog", "To Do", "In Progress", "Review", "Done"];
 
-  
+  // ... fungsi bawaan Anda (misal: const downloadJSON = (type) => { ... })
+
+  // 🟢 TEMPELKAN KEDUA FUNGSI API INI DI SINI:
+  async function pushToTrello() {
+    if (!trelloKey || !trelloToken || !trelloListId) {
+      alert("Harap isi semua kredensial Trello terlebih dahulu!");
+      return;
+    }
+    setPushStatus("Mengirim tiket ke Trello...");
+    try {
+      for (const t of result.kanban_tickets) { 
+        await fetch(`/api-trello/1/cards?key=${trelloKey}&token=${trelloToken}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name: `[${t.id}] ${t.title}`,
+            desc: `**Type**: ${t.type}\n**Story Points**: ${t.story_points}\n\n${t.description}`,
+            idList: trelloListId,
+          })
+        });
+      }
+      setPushStatus("✅ Semua tiket sukses didorong ke Trello!");
+    } catch (error) {
+      console.error(error);
+      setPushStatus("❌ Gagal mengirim ke Trello.");
+    }
+  }
+
+  async function pushToJira() {
+    if (!jiraEmail || !jiraToken || !jiraProjectKey) {
+      alert("Harap isi semua kredensial Jira terlebih dahulu!");
+      return;
+    }
+    setPushStatus("Mengirim tiket ke Jira...");
+    const encodedAuth = btoa(`${jiraEmail}:${jiraToken}`);
+    try {
+      for (const t of result.kanban_tickets) { 
+        const bodyData = {
+          fields: {
+            project: { key: jiraProjectKey },
+            summary: t.title,
+            description: {
+              type: "doc",
+              version: 1,
+              content: [{
+                type: "paragraph",
+                content: [{ type: "text", text: t.description || "Tidak ada deskripsi." }]
+              }]
+            },
+            issuetype: { name: t.type || "Task" }
+          }
+        };
+        await fetch(`/api-jira/rest/api/3/issue`, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Basic ${encodedAuth}`,
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+          },
+          body: JSON.stringify(bodyData)
+        });
+      }
+      setPushStatus("✅ Semua tiket sukses didorong ke Jira!");
+    } catch (error) {
+      console.error(error);
+      setPushStatus("❌ Gagal mengirim ke Jira.");
+    }
+  }
+ 
 
   // ─────────────────────────────────────────────────────────────────────────
   return (
@@ -684,8 +732,8 @@ const analyzeWithAI = useCallback(async () => {
                 </p>
               </div>
               <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-                {/* Download buttons */}
-                {[
+ {/* Download buttons */}
+ {[
                   { label: "Notulensi .md", icon: "ti-file-text", action: downloadMD, color: "#185FA5" },
                   { label: "Kanban .xlsx", icon: "ti-table", action: downloadXLSX, color: "#3B6D11" },
                   { label: "Trello .json", icon: "ti-brand-trello", action: () => downloadJSON("trello"), color: "#3C3489" },
@@ -696,6 +744,46 @@ const analyzeWithAI = useCallback(async () => {
                     {btn.label}
                   </button>
                 ))}
+              </div>
+            </div>
+
+            {/* 🟢 PANEL INTEGRASI API CLOUD (Diselipkan tepat di bawahnya) */}
+            <div style={{ marginTop: 16, padding: 14, border: "0.5px solid var(--color-border-secondary)", borderRadius: 12, background: "var(--color-background-secondary)" }}>
+              <div style={{ fontSize: 12, fontWeight: 600, color: "var(--color-text-primary)", marginBottom: 12, display: "flex", alignItems: "center", gap: 6, textTransform: "uppercase", letterSpacing: "0.03em" }}>
+                <i className="ti ti-link" style={{ fontSize: 14, color: "#185FA5" }} /> 
+                Integrasi Cloud Langsung (API)
+              </div>
+
+              {/* Status Banner */}
+              {pushStatus && (
+                <div style={{ padding: "6px 10px", borderRadius: 6, fontSize: 11, marginBottom: 10, fontWeight: 500, display: "flex", alignItems: "center", gap: 5, background: pushStatus.includes("✅") ? "#E6F4EA" : pushStatus.includes("❌") ? "#FCE8E6" : "#E8F0FE", color: pushStatus.includes("✅") ? "#137333" : pushStatus.includes("❌") ? "#C5221F" : "#1A73E8" }}>
+                  <i className={`ti ${pushStatus.includes("✅") ? "ti-check" : pushStatus.includes("❌") ? "ti-alert-circle" : "ti-loader"}`} />
+                  {pushStatus}
+                </div>
+              )}
+
+              <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
+                {/* Panel Input Trello */}
+                <div style={{ flex: 1, minWidth: 200, display: "flex", flexDirection: "column", gap: 6 }}>
+                  <span style={{ fontSize: 11, fontWeight: 600, color: "#3C3489", display: "flex", alignItems: "center", gap: 4 }}><i className="ti ti-brand-trello" /> TRELLO BOARD</span>
+                  <input type="text" placeholder="Trello API Key" value={trelloKey} onChange={e => setTrelloKey(e.target.value)} style={{ padding: "6px 10px", borderRadius: 6, border: "0.5px solid var(--color-border-tertiary)", fontSize: 11.5, background: "#fff", outline: "none", color: "var(--color-text-primary)" }} />
+                  <input type="password" placeholder="Trello Token" value={trelloToken} onChange={e => setTrelloToken(e.target.value)} style={{ padding: "6px 10px", borderRadius: 6, border: "0.5px solid var(--color-border-tertiary)", fontSize: 11.5, background: "#fff", outline: "none", color: "var(--color-text-primary)" }} />
+                  <input type="text" placeholder="Target List ID" value={trelloListId} onChange={e => setTrelloListId(e.target.value)} style={{ padding: "6px 10px", borderRadius: 6, border: "0.5px solid var(--color-border-tertiary)", fontSize: 11.5, background: "#fff", outline: "none", color: "var(--color-text-primary)" }} />
+                  <button onClick={pushToTrello} style={{ padding: "6px 10px", borderRadius: 6, border: "0.5px solid #3C348940", cursor: "pointer", fontSize: 11.5, fontWeight: 600, background: "#3C3489", color: "#fff", marginTop: 2, display: "flex", alignItems: "center", justifyContent: "center", gap: 5 }}>
+                    Push ke Trello
+                  </button>
+                </div>
+
+                {/* Panel Input Jira */}
+                <div style={{ flex: 1, minWidth: 200, display: "flex", flexDirection: "column", gap: 6 }}>
+                  <span style={{ fontSize: 11, fontWeight: 600, color: "#854F0B", display: "flex", alignItems: "center", gap: 4 }}><i className="ti ti-bug" /> JIRA CLOUD</span>
+                  <input type="email" placeholder="Atlassian Email" value={jiraEmail} onChange={e => setJiraEmail(e.target.value)} style={{ padding: "6px 10px", borderRadius: 6, border: "0.5px solid var(--color-border-tertiary)", fontSize: 11.5, background: "#fff", outline: "none", color: "var(--color-text-primary)" }} />
+                  <input type="password" placeholder="Jira API Token" value={jiraToken} onChange={e => setJiraToken(e.target.value)} style={{ padding: "6px 10px", borderRadius: 6, border: "0.5px solid var(--color-border-tertiary)", fontSize: 11.5, background: "#fff", outline: "none", color: "var(--color-text-primary)" }} />
+                  <input type="text" placeholder="Project Key (e.g., SCRUM)" value={jiraProjectKey} onChange={e => setJiraProjectKey(e.target.value)} style={{ padding: "6px 10px", borderRadius: 6, border: "0.5px solid var(--color-border-tertiary)", fontSize: 11.5, background: "#fff", outline: "none", color: "var(--color-text-primary)" }} />
+                  <button onClick={pushToJira} style={{ padding: "6px 10px", borderRadius: 6, border: "0.5px solid #854F0B40", cursor: "pointer", fontSize: 11.5, fontWeight: 600, background: "#854F0B", color: "#fff", marginTop: 2, display: "flex", alignItems: "center", justifyContent: "center", gap: 5 }}>
+                    Push ke Jira Cloud
+                  </button>
+                </div>
               </div>
             </div>
 
@@ -953,36 +1041,6 @@ const analyzeWithAI = useCallback(async () => {
                 </div>
               </div>
             )}
-
-            {/* ─── TARUH DI SINI: DECISION AUDIT TRAIL ─── */}
-            {selectedTicket.ai_reasoning && (
-              <div style={{
-                marginBottom: 12, // Sesuaikan jarak bawah dengan elemen lain
-                padding: "10px 14px",
-                backgroundColor: "#f0fdf4",
-                borderLeft: "4px solid #22c55e",
-                borderRadius: "6px",
-                fontSize: "12.5px", // Samakan ukuran font dengan bagian lain
-              }}>
-                <p style={{ 
-                  margin: "0 0 4px 0", 
-                  fontWeight: 600, 
-                  color: "#166534", 
-                  display: "flex", 
-                  alignItems: "center", 
-                  gap: "6px",
-                  fontSize: 12,
-                  textTransform: "uppercase",
-                  letterSpacing: "0.05em"
-                }}>
-                  <span>🤖</span> AI Reasoning (Audit)
-                </p>
-                <p style={{ margin: 0, color: "#1e4620", lineHeight: "1.5" }}>
-                  {selectedTicket.ai_reasoning}
-                </p>
-              </div>
-            )}
-            {/* ─────────────────────────────────────────── */}
 
             
 

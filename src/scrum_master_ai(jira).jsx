@@ -524,7 +524,67 @@ const analyzeWithAI = useCallback(async () => {
 
   const KANBAN_COLS = ["Backlog", "To Do", "In Progress", "Review", "Done"];
 
-  
+  const handleExportToJira = async () => {
+    if (!result || !result.kanban_tickets || result.kanban_tickets.length === 0) return;
+
+    // Kita tidak perlu lagi prompt Domain Jira karena sudah di-hardcode di Vite Proxy
+    const email = prompt("Masukkan Email akun Jira Anda:");
+    if (!email) return;
+    
+    const apiToken = prompt("Masukkan Jira API Token Anda:\n(Bukan password email!)");
+    if (!apiToken) return;
+    
+    const projectKey = prompt("Masukkan Project Key Jira Anda\n(contoh: SCRUM):");
+    if (!projectKey) return;
+
+    const auth = btoa(`${email}:${apiToken}`);
+    let successCount = 0;
+
+    for (const ticket of result.kanban_tickets) {
+      try {
+        // PERHATIKAN: URL-nya diubah jadi memanggil /jira-api/ lokal
+        const response = await fetch(`/jira-api/rest/api/3/issue`, {
+          method: "POST",
+          headers: {
+            "Authorization": `Basic ${auth}`,
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "X-Atlassian-Token": "no-check" // Header wajib Jira
+          },
+          body: JSON.stringify({
+            fields: {
+              project: { key: projectKey },
+              summary: ticket.title,
+              description: {
+                type: "doc",
+                version: 1,
+                content: [
+                  {
+                    type: "paragraph",
+                    content: [{ type: "text", text: ticket.description || "Tidak ada deskripsi." }]
+                  }
+                ]
+              },
+              issuetype: { name: ticket.type.toLowerCase() === "bug" ? "Bug" : "Task" } 
+              // Jika masih gagal, ganti jadi "Story"
+            }
+          })
+        });
+
+        if (response.ok) {
+          successCount++;
+          console.log(`✅ SUCCESS: Tiket '${ticket.title}' berhasil dibuat.`);
+        } else {
+          const errData = await response.json();
+          alert(`❌ Gagal export tiket '${ticket.title}'.\nAlasan Jira: ${JSON.stringify(errData.errors || errData)}`);
+        }
+      } catch (error) {
+        alert(`🚨 ERROR KONEKSI: ${error.message}`);
+      }
+    }
+
+    alert(`Proses selesai! ${successCount} tiket berhasil dibuat di Jira.`);
+  };
 
   // ─────────────────────────────────────────────────────────────────────────
   return (
@@ -696,6 +756,31 @@ const analyzeWithAI = useCallback(async () => {
                     {btn.label}
                   </button>
                 ))}
+
+                {/* ─── TAMBAHKAN TOMBOL EKSPOR JIRA DI SINI ─── */}
+                <button 
+                    onClick={handleExportToJira} 
+                    style={{ 
+                      padding: "5px 10px", 
+                      borderRadius: 8, 
+                      border: "none", 
+                      cursor: "pointer", 
+                      fontSize: 11.5, 
+                      fontWeight: 600, 
+                      fontFamily: "inherit", 
+                      background: "#0052CC", // Warna biru Jira
+                      color: "#ffffff", 
+                      display: "flex", 
+                      alignItems: "center", 
+                      gap: 5,
+                      boxShadow: "0 2px 4px rgba(0,82,204,0.2)"
+                    }}
+                  >
+                    <i className="ti ti-brand-jira" style={{ fontSize: 13 }} />
+                    Push to Jira API
+                  </button>
+                  {/* ────────────────────────────────────────────── */}
+
               </div>
             </div>
 
